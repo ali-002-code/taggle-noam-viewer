@@ -251,21 +251,41 @@ function layoutColumns(cols, w, h, marginX) {
   return positions;
 }
 
-function renderDetail() {
-  clearSvg();
-  const rec = DATA.recommendations.find(r => r.entity_id === selectedEntityId);
-  if (!rec) { renderOverview(); return; }
-  const w = svg.clientWidth || 1000, h = Math.max(svg.clientHeight || 700, computeHeight(rec));
+// Net directional sign of a two-hop path, collapsed from its two always-
+// informative legs (Noam<->A and A<->C never carry neutral evidence - see
+// noam_centric_recommendation_explanations.py's build logic) into ONE
+// agree/disagree verdict for the hidden chain: same-signed legs reinforce
+// (net AGREE), opposite-signed legs cancel (net DISAGREE). Falls back to
+// neutral only if either leg is genuinely missing evidence (defensive -
+// should not occur for a real two-hop entry, but never silently invents a
+// taste-match where none exists).
+function collapsedTwoHopAlignment(path) {
+  const noamEv = path.noam_to_first_hop_evidence[0];
+  const bridgeEv = path.first_hop_to_second_hop_evidence[0];
+  if (!noamEv || !bridgeEv) return { informative: false, kind: 'neutral' };
+  const netSign = Math.sign(path.noam_to_first_hop_signed_affinity * path.first_hop_to_second_hop_signed_affinity);
+  if (netSign === 0) return { informative: false, kind: 'neutral' };
+  return { informative: true, kind: netSign > 0 ? 'AGREE' : 'DISAGREE' };
+}
 
-  // --- build node/edge model ---
-  const seedNodes = new Map();   // entity_id -> {id,title,noam_rating}
-  const reviewer1Nodes = new Map(); // reviewer_id -> {id, display_name}
-  const bridgeNodes = new Map(); // entity_id -> title  (A<->C evidence restaurant)
-  const reviewer2Nodes = new Map(); // reviewer_id -> display_name (second hop, two-hop only)
-  const edges = []; // {from,to,kind,glow,label,fromCol,toCol}
+// Pure graph-model builder - no DOM access, so it can be exercised headlessly
+// (see tests/test_noam_centric_recommendation_viewer_graph_model.py). Returns
+// node id -> label maps plus an edge list; renderDetail() below only turns
+// this model into SVG. Enforces, by construction, that every reviewer node
+// placed in SIMPLE mode's combined reviewer column has a real noam-side edge:
+// a two-hop path's intermediate first-hop reviewer is added to r1Nodes ONLY
+// in detailed mode (where its own real edges are also drawn); in simple mode
+// the whole hidden chain collapses into a single direct noam->r2 edge whose
+// colour reflects the chain's actual net alignment, never a blanket neutral.
+function buildGraphModel(rec, mode) {
+  const seedNodes = new Map();
+  const r1Nodes = new Map();
+  const bridgeNodes = new Map();
+  const r2Nodes = new Map();
+  const edges = [];
 
   rec.one_hop_reviewers.forEach(rev => {
-    reviewer1Nodes.set(rev.reviewer_id, rev.display_name || rev.reviewer_id);
+    r1Nodes.set(rev.reviewer_id, rev.display_name || rev.reviewer_id);
     rev.shared_restaurants.forEach(sr => {
       seedNodes.set(sr.entity_id, sr.title);
       if (mode === 'detailed') {
@@ -276,11 +296,8 @@ function renderDetail() {
       }
     });
     const bestInformative = rev.shared_restaurants.find(s => s.informative);
-    edges.push({
-      from: mode === 'detailed' ? 'r1:' + rev.reviewer_id : 'r1:' + rev.reviewer_id,
-      to: 'dest', kind: 'neutral', glow: false,
-      label: `rated ${rev.rating_of_recommendation}★`,
-    });
+    edges.push({ from: 'r1:' + rev.reviewer_id, to: 'dest', kind: 'neutral', glow: false,
+      label: `rated ${rev.rating_of_recommendation}★` });
     if (mode === 'simple') {
       edges.push({ from: 'noam', to: 'r1:' + rev.reviewer_id,
         kind: bestInformative ? bestInformative.alignment : 'neutral', glow: !!bestInformative, label: null });
@@ -289,12 +306,14 @@ function renderDetail() {
 
   rec.two_hop_only_reviewers.forEach(rev => {
     const path = rev.paths[0]; // one representative path, deterministic (first by sort order)
-    reviewer2Nodes.set(rev.reviewer_id, rev.display_name || rev.reviewer_id);
+    r2Nodes.set(rev.reviewer_id, rev.display_name || rev.reviewer_id);
     if (!path) return;
-    reviewer1Nodes.set(path.first_hop_reviewer_id, path.first_hop_display_name || path.first_hop_reviewer_id);
     const noamEv = path.noam_to_first_hop_evidence[0];
     const bridgeEv = path.first_hop_to_second_hop_evidence[0];
     if (mode === 'detailed') {
+      // the bridge reviewer is only ever rendered as its own node (with its
+      // own real edges) in detailed mode - never left dangling in simple mode
+      r1Nodes.set(path.first_hop_reviewer_id, path.first_hop_display_name || path.first_hop_reviewer_id);
       if (noamEv) {
         seedNodes.set(noamEv.entity_id, noamEv.title);
         edges.push({ from: 'noam', to: 'seed:' + noamEv.entity_id, kind: 'neutral', glow: false, label: null });
@@ -312,8 +331,12 @@ function renderDetail() {
       edges.push({ from: 'r2:' + rev.reviewer_id, to: 'dest', kind: 'neutral', glow: false,
         label: `rated ${rev.rating_of_recommendation}★` });
     } else {
-      edges.push({ from: 'noam', to: 'r2:' + rev.reviewer_id, kind: 'neutral', glow: false, label: null,
-        dashed: true });
+      // collapse the hidden Noam->seed->A->bridge->C chain into ONE direct
+      // edge, coloured from the chain's real net alignment (never a blanket
+      // neutral when informative evidence actually exists).
+      const collapsed = collapsedTwoHopAlignment(path);
+      edges.push({ from: 'noam', to: 'r2:' + rev.reviewer_id,
+        kind: collapsed.informative ? collapsed.kind : 'neutral', glow: collapsed.informative, label: null });
       edges.push({ from: 'r2:' + rev.reviewer_id, to: 'dest', kind: 'neutral', glow: false,
         label: `rated ${rev.rating_of_recommendation}★` });
     }
@@ -321,6 +344,17 @@ function renderDetail() {
       edges.push({ from: 'r2:' + rev.reviewer_id, to: 'dest', note: `+${rev.n_paths - 1} more path(s)` });
     }
   });
+
+  return { seedNodes, r1Nodes, bridgeNodes, r2Nodes, edges };
+}
+
+function renderDetail() {
+  clearSvg();
+  const rec = DATA.recommendations.find(r => r.entity_id === selectedEntityId);
+  if (!rec) { renderOverview(); return; }
+  const w = svg.clientWidth || 1000, h = Math.max(svg.clientHeight || 700, computeHeight(rec));
+
+  const { seedNodes, r1Nodes: reviewer1Nodes, bridgeNodes, r2Nodes: reviewer2Nodes, edges } = buildGraphModel(rec, mode);
 
   // --- columns ---
   const cols = mode === 'detailed'
